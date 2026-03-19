@@ -135,6 +135,54 @@ def rolling_z_score(values: List[float], window: int) -> float:
     return (windowed[-1] - mean) / math.sqrt(variance)
 
 
+def norm_cdf(x: float) -> float:
+    """Standard normal CDF using math.erf."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_call_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Black-Scholes call option price."""
+    if T <= 0 or sigma <= 0:
+        return max(0.0, S - K)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
+
+
+def bs_put_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Black-Scholes put price via put-call parity: P = C - S + K*e^(-rT)."""
+    return bs_call_price(S, K, T, r, sigma) - S + K * math.exp(-r * T)
+
+
+def bs_delta(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Call delta: dC/dS = N(d1)."""
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    return norm_cdf(d1)
+
+
+def implied_vol(
+    market_price: float, S: float, K: float, T: float, r: float,
+    option_type: str = "call",
+) -> float:
+    """Solve for implied volatility via bisection. Returns None if no convergence."""
+    if T <= 0:
+        return None
+    lo, hi = 0.01, 5.0
+    price_fn = bs_call_price if option_type == "call" else bs_put_price
+    for _ in range(50):
+        mid = (lo + hi) / 2.0
+        price = price_fn(S, K, T, r, mid)
+        if abs(price - market_price) < 0.001:
+            return mid
+        if price > market_price:
+            hi = mid
+        else:
+            lo = mid
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Logger (compatible with Prosperity Visualizer)
 # ---------------------------------------------------------------------------
@@ -350,6 +398,18 @@ class Trader:
                 result[comp].extend(comp_orders)
             else:
                 result[comp] = comp_orders
+
+        # --- Merge hedge orders from options strategies ---
+        hedge_store = self.state_data.pop("_hedge_orders", {})
+        for sym, hedge_list in hedge_store.items():
+            hedge_orders = [Order(sym, p, q) for p, q in hedge_list]
+            if sym in result:
+                result[sym].extend(hedge_orders)
+            else:
+                result[sym] = hedge_orders
+
+        # --- Clean up circular arb cache (not persisted across timesteps) ---
+        self.state_data.pop("_circ_cache", None)
 
         # --- Serialize state ---
         trader_data = self._save_state()
@@ -716,18 +776,245 @@ class Trader:
         return orders, 0
 
     def strategy_circular_arb(
-        self, product, state, config, position, pos_limit
+        self,
+        product: str,
+        state: TradingState,
+        config: dict,
+        position: int,
+        pos_limit: int,
     ) -> Tuple[List[Order], int]:
-        """Circular/triangular arbitrage across exchange rates."""
-        # TODO: Session 3
-        return [], 0
+        """
+        Circular/triangular arbitrage across products acting as exchange rates.
+
+        Detects profitable cycles by checking if the product of mid rates
+        around the cycle exceeds 1.0 (profit > min_profit_bps). Each leg of
+        the cycle gets its own call; this method only places orders for its
+        own product.
+
+        The cycle profit computation is cached in self.state_data["_circ_cache"]
+        keyed by timestamp to avoid recomputation across legs.
+
+        Config keys:
+            cycle: list[str] — product symbols forming the cycle
+            rate_type: "mid" or "best"
+            min_profit_bps: float — minimum profit in basis points (default 10)
+            max_order_size: int — max units per leg (default 20)
+            cycle_role: "buy" or "sell" — direction for this leg
+        """
+        orders: List[Order] = []
+        cycle = config["cycle"]
+        rate_type = config.get("rate_type", "mid")
+        min_profit_bps = config.get("min_profit_bps", 10)
+        max_order_size = config.get("max_order_size", 20)
+        cycle_role = config.get("cycle_role", "buy")
+
+        # --- Cache cycle computation per timestamp ---
+        cache_key = "_circ_cache"
+        if cache_key not in self.state_data:
+            self.state_data[cache_key] = {}
+        cache = self.state_data[cache_key]
+        ts_key = str(state.timestamp)
+
+        cycle_tuple_key = ",".join(cycle)
+        cache_entry_key = f"{ts_key}:{cycle_tuple_key}"
+
+        if cache_entry_key not in cache:
+            # Compute rates for each leg
+            rates = []
+            for leg in cycle:
+                leg_od = state.order_depths.get(leg)
+                if leg_od is None:
+                    rates = None
+                    break
+                if rate_type == "best":
+                    bb = best_bid(leg_od)
+                    ba = best_ask(leg_od)
+                    if bb is None or ba is None:
+                        rates = None
+                        break
+                    rates.append((bb, ba, mid_price(leg_od)))
+                else:
+                    m = mid_price(leg_od)
+                    if m is None:
+                        rates = None
+                        break
+                    rates.append((None, None, m))
+
+            if rates is None:
+                cache[cache_entry_key] = {"profitable": False}
+            else:
+                # Product of mid rates around the cycle
+                product_of_mids = 1.0
+                for _, _, m in rates:
+                    product_of_mids *= m
+                # For exchange rates, profit = (product_of_rates - 1) * 10000 bps
+                # But if products are prices not rates, we check the
+                # round-trip: does buying through the cycle yield > 1?
+                # Use log-sum for numerical stability
+                log_sum = sum(math.log(m) for _, _, m in rates if m > 0)
+                profit_bps = (math.exp(log_sum) - 1.0) * 10000.0
+                cache[cache_entry_key] = {
+                    "profitable": abs(profit_bps) >= min_profit_bps,
+                    "profit_bps": profit_bps,
+                    "rates": rates,
+                }
+        else:
+            pass  # already computed
+
+        result = cache.get(cache_entry_key, {"profitable": False})
+
+        if not result.get("profitable", False):
+            return orders, 0
+
+        profit_bps = result.get("profit_bps", 0)
+        od = state.order_depths.get(product)
+        if od is None:
+            return orders, 0
+
+        # Determine order direction based on cycle_role and profit direction
+        if profit_bps > 0 and cycle_role == "buy":
+            ba = best_ask(od)
+            if ba is not None:
+                orders.append(Order(product, ba, max_order_size))
+        elif profit_bps > 0 and cycle_role == "sell":
+            bb = best_bid(od)
+            if bb is not None:
+                orders.append(Order(product, bb, -max_order_size))
+        elif profit_bps < 0 and cycle_role == "buy":
+            bb = best_bid(od)
+            if bb is not None:
+                orders.append(Order(product, bb, -max_order_size))
+        elif profit_bps < 0 and cycle_role == "sell":
+            ba = best_ask(od)
+            if ba is not None:
+                orders.append(Order(product, ba, max_order_size))
+
+        logger.print(
+            f"{product} circular_arb: profit_bps={profit_bps:.1f}, "
+            f"role={cycle_role}, orders={len(orders)}"
+        )
+        return orders, 0
 
     def strategy_options(
-        self, product, state, config, position, pos_limit
+        self,
+        product: str,
+        state: TradingState,
+        config: dict,
+        position: int,
+        pos_limit: int,
     ) -> Tuple[List[Order], int]:
-        """Options pricing and delta hedging."""
-        # TODO: Session 3
-        return [], 0
+        """
+        Options pricing via Black-Scholes with IV mean-reversion trading.
+
+        Computes implied vol from the option mid price, tracks IV history,
+        and trades when IV z-score crosses entry/exit thresholds.
+        Optionally generates delta hedge orders for the underlying, stored
+        in self.state_data["_hedge_orders"] for run() to merge.
+
+        Config keys:
+            underlying: str — symbol of underlying (e.g. "VOLCANIC_ROCK")
+            strike: int
+            expiry_days: int — days to expiry (T = expiry_days / 252)
+            risk_free_rate: float (default 0.0)
+            iv_window: int — rolling window for IV history (default 20)
+            iv_z_entry: float — z-score to enter IV trade (default 1.5)
+            iv_z_exit: float — z-score to exit (default 0.5)
+            delta_hedge: bool — whether to hedge with underlying (default False)
+        """
+        orders: List[Order] = []
+        underlying_sym = config["underlying"]
+        strike = config["strike"]
+        T = config.get("expiry_days", 5) / 252.0
+        r = config.get("risk_free_rate", 0.0)
+        iv_window = config.get("iv_window", 20)
+        iv_z_entry = config.get("iv_z_entry", 1.5)
+        iv_z_exit = config.get("iv_z_exit", 0.5)
+        do_hedge = config.get("delta_hedge", False)
+        max_order_size = config.get("max_order_size", 20)
+
+        # Get underlying spot price
+        underlying_od = state.order_depths.get(underlying_sym)
+        if underlying_od is None:
+            return orders, 0
+        spot = mid_price(underlying_od)
+        if spot is None:
+            return orders, 0
+
+        # Get option mid price
+        od = state.order_depths.get(product)
+        if od is None:
+            return orders, 0
+        opt_mid = mid_price(od)
+        if opt_mid is None:
+            return orders, 0
+
+        # Compute implied vol
+        iv = implied_vol(opt_mid, spot, strike, T, r, "call")
+        if iv is None:
+            return orders, 0
+
+        # Track IV history
+        pstate = self._get_product_state(product)
+        iv_history = pstate.get("iv_history", [])
+        iv_history.append(iv)
+        if len(iv_history) > iv_window:
+            iv_history = iv_history[-iv_window:]
+        pstate["iv_history"] = iv_history
+
+        z = rolling_z_score(iv_history, iv_window)
+        logger.print(f"{product} options: iv={iv:.4f}, z={z:.2f}, spot={spot:.1f}")
+
+        opt_bb = best_bid(od)
+        opt_ba = best_ask(od)
+
+        if z > iv_z_entry:
+            # IV is high → sell options (expect IV to fall, options overpriced)
+            if opt_bb is not None:
+                orders.append(Order(product, opt_bb, -max_order_size))
+        elif z < -iv_z_entry:
+            # IV is low → buy options (expect IV to rise, options underpriced)
+            if opt_ba is not None:
+                orders.append(Order(product, opt_ba, max_order_size))
+        elif abs(z) < iv_z_exit and position != 0:
+            # Unwind toward flat
+            if position > 0 and opt_bb is not None:
+                orders.append(Order(product, opt_bb, -min(position, max_order_size)))
+            elif position < 0 and opt_ba is not None:
+                orders.append(Order(product, opt_ba, min(-position, max_order_size)))
+
+        # Delta hedging: store hedge orders for run() to merge
+        if do_hedge and orders:
+            delta = bs_delta(spot, strike, T, r, iv)
+            # Net option delta from position + new orders
+            new_opt_qty = sum(o.quantity for o in orders)
+            total_opt_pos = position + new_opt_qty
+            # Hedge: short delta * option_position shares of underlying
+            hedge_qty = -int(round(delta * total_opt_pos))
+            if hedge_qty != 0:
+                underlying_bb = best_bid(underlying_od)
+                underlying_ba = best_ask(underlying_od)
+                if hedge_qty > 0 and underlying_ba is not None:
+                    hedge_order = Order(underlying_sym, underlying_ba, hedge_qty)
+                elif hedge_qty < 0 and underlying_bb is not None:
+                    hedge_order = Order(underlying_sym, underlying_bb, hedge_qty)
+                else:
+                    hedge_order = None
+                if hedge_order is not None:
+                    # Clip to underlying position limit
+                    u_pos = state.position.get(underlying_sym, 0)
+                    u_limit = PRODUCT_CONFIG.get(underlying_sym, {}).get(
+                        "position_limit", 400
+                    )
+                    clipped = clip_orders(
+                        underlying_sym, [hedge_order], u_pos, u_limit
+                    )
+                    if clipped:
+                        hedge_store = self.state_data.setdefault("_hedge_orders", {})
+                        hedge_store.setdefault(underlying_sym, []).extend(
+                            [(o.price, o.quantity) for o in clipped]
+                        )
+
+        return orders, 0
 
     def strategy_cross_exchange(
         self,
