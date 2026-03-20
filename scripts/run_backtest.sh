@@ -27,5 +27,5 @@ fi
 if [ -z "$DAY" ]; then
     $BT trader.py $ROUND
 else
-    $BT trader.py $ROUND --day $DAY
+    $BT trader.py $ROUND-$DAY
 fi
